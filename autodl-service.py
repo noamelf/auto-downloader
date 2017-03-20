@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import timeit
+from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
-import async_timeout
 import click as click
 from aiohttp import web
 
@@ -17,35 +17,31 @@ def _get_filename(url):
     return parsed_url.path.rsplit('/', 1)[-1] if parsed_url.path else parsed_url.netloc
 
 
-async def _write_content_to_file(filename, content):
-    with open(filename, 'wb') as fd:
-        while True:
-            chunk = await content.read()
-            if not chunk:
-                break
-            fd.write(chunk)
+def _write_content_to_file(filename, content):
+    with filename.open('wb') as fd:
+        fd.write(content)
 
 
 async def _request(url):
     async with aiohttp.ClientSession() as session:
-        with async_timeout.timeout(10):
-            async with session.get(url) as resp:
-                # await asyncio.sleep(2)
-                return resp
+        async with session.get(url) as resp:
+            return resp.status, await resp.content.read()
 
 
 async def _timed_request(url):
     start_time = timeit.default_timer()
-    resp = await _request(url)
+    status, content = await _request(url)
     elapsed = timeit.default_timer() - start_time
-    return resp, elapsed
+    return status, content, elapsed
 
 
-async def _download_url(semaphore, url):
-    resp, time_elapsed = await _timed_request(url)
-    logger.info(f'Finish download: {url} {resp.status} {time_elapsed}s')
+async def _download_url(semaphore, url, filepath):
+    status, content, time_elapsed = await _timed_request(url)
+    logger.info(f'Finish download: {url} {status} {time_elapsed}s')
 
-    await _write_content_to_file(_get_filename(url), resp.content)
+    if 200 <= status < 300:
+        _write_content_to_file(filepath, content)
+        logger.info(f'Write to file: {url} {filepath}')
 
     semaphore.release()
 
@@ -54,22 +50,36 @@ async def _consume(queue, concurrent_downloads):
     semaphore = asyncio.Semaphore(value=concurrent_downloads)
     while True:
         await semaphore.acquire()
-        url = await queue.get()
+        url, filepath = await queue.get()
         logger.info(f'Pop from queue: {url}')
-        asyncio.ensure_future(_download_url(semaphore, url))
+        asyncio.ensure_future(_download_url(semaphore, url, filepath))
 
 
 class Handler:
     def __init__(self, queue):
         self.q = queue
 
-    async def handle(self, request):
+    async def add(self, request):
         data = await request.json()
 
         url = data['url']
+        dirpath = Path(data['dirpath'])
+
+        if not dirpath.is_dir():
+            return web.Response(body=f'No such directory location {dirpath}'.encode(), status=400)
+
+        filename = dirpath / _get_filename(url)
         logger.info(f'Add to queue: {url}')
 
-        await self.q.put(url)
+        await self.q.put((url, filename))
+
+        return web.Response()
+
+    async def clear(self, _):
+        # this is somewhat of a hack since for some reason there is no `clear` method on a asyncio
+        # Queue.
+        while not self.q.empty():
+            self.q.get_nowait()
 
         return web.Response()
 
@@ -81,7 +91,8 @@ def main(concurrent_downloads):
 
     app = web.Application()
     handler = Handler(downloads_queue)
-    app.router.add_post('/', handler.handle)
+    app.router.add_post('/add', handler.add)
+    app.router.add_post('/clear', handler.clear)
 
     asyncio.ensure_future(_consume(downloads_queue, concurrent_downloads))
 
